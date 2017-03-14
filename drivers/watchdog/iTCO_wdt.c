@@ -174,7 +174,7 @@ static void iTCO_wdt_set_NO_REBOOT_bit(void)
 	/* Set the NO_REBOOT bit: this disables reboots */
 	if (iTCO_wdt_private.iTCO_version >= 2) {
 		val32 = readl(iTCO_wdt_private.gcs_pmc);
-		val32 |= no_reboot_bit();
+		val32 |= no_reboot_bit(); // bit4为NO_REBOOT标志
 		writel(val32, iTCO_wdt_private.gcs_pmc);
 	} else if (iTCO_wdt_private.iTCO_version == 1) {
 		pci_read_config_dword(iTCO_wdt_private.pdev, 0xd4, &val32);
@@ -231,6 +231,7 @@ static int iTCO_wdt_start(struct watchdog_device *wd_dev)
 	else if (iTCO_wdt_private.iTCO_version == 1)
 		outb(0x01, TCO_RLD);
 
+	// 0表示TCO计时，1表示禁止
 	/* Bit 11: TCO Timer Halt -> 0 = The TCO timer is enabled to count */
 	val = inw(TCO1_CNT);
 	val &= 0xf7ff;
@@ -238,6 +239,7 @@ static int iTCO_wdt_start(struct watchdog_device *wd_dev)
 	val = inw(TCO1_CNT);
 	spin_unlock(&iTCO_wdt_private.io_lock);
 
+	// 如果bit11为1，则说明无法启动WDT，失败
 	if (val & 0x0800)
 		return -1;
 	return 0;
@@ -253,7 +255,7 @@ static int iTCO_wdt_stop(struct watchdog_device *wd_dev)
 
 	/* Bit 11: TCO Timer Halt -> 1 = The TCO timer is disabled */
 	val = inw(TCO1_CNT);
-	val |= 0x0800;
+	val |= 0x0800; // 禁止
 	outw(val, TCO1_CNT);
 	val = inw(TCO1_CNT);
 
@@ -262,6 +264,7 @@ static int iTCO_wdt_stop(struct watchdog_device *wd_dev)
 
 	spin_unlock(&iTCO_wdt_private.io_lock);
 
+    // 如果bit11为0，说明没有成功停止看门狗，返回失败
 	if ((val & 0x0800) == 0)
 		return -1;
 	return 0;
@@ -273,6 +276,7 @@ static int iTCO_wdt_ping(struct watchdog_device *wd_dev)
 
 	iTCO_vendor_pre_keepalive(iTCO_wdt_private.smi_res, wd_dev->timeout);
 
+    // 写1到TCO_RLD寄存器，重新计时
 	/* Reload the timer by writing to the TCO Timer Counter register */
 	if (iTCO_wdt_private.iTCO_version >= 2) {
 		outw(0x01, TCO_RLD);
@@ -294,7 +298,7 @@ static int iTCO_wdt_set_timeout(struct watchdog_device *wd_dev, unsigned int t)
 	unsigned char val8;
 	unsigned int tmrval;
 
-	tmrval = seconds_to_ticks(t);
+	tmrval = seconds_to_ticks(t); // 时间(单位为秒)转换为tick
 
 	/* For TCO v1 the timer counts down twice before rebooting */
 	if (iTCO_wdt_private.iTCO_version == 1)
@@ -310,6 +314,7 @@ static int iTCO_wdt_set_timeout(struct watchdog_device *wd_dev, unsigned int t)
 
 	iTCO_vendor_pre_set_heartbeat(tmrval);
 
+    // 将新的超时时间写入TMR寄存器
 	/* Write new heartbeat to watchdog */
 	if (iTCO_wdt_private.iTCO_version >= 2) {
 		spin_lock(&iTCO_wdt_private.io_lock);
@@ -336,6 +341,7 @@ static int iTCO_wdt_set_timeout(struct watchdog_device *wd_dev, unsigned int t)
 	}
 
 	wd_dev->timeout = t;
+    heartbeat = t; // ?
 	return 0;
 }
 
@@ -391,6 +397,71 @@ static struct watchdog_device iTCO_wdt_watchdog_dev = {
 	.info =		&ident,
 	.ops =		&iTCO_wdt_ops,
 };
+
+// 实际中默认使能，这时只是初始化值
+static int g_wdt_enable = -1;
+
+// cat timeout　调用此函数
+static ssize_t timeout_show(struct device *dev, 
+		struct device_attribute *attr, char *buf)
+{
+	//printk("set data to user space: %d\n", heartbeat);
+	return sprintf(buf, "%u\n", heartbeat);
+}
+
+// echo 100 > timeout　调用此函数
+static ssize_t timeout_store(struct device *dev,
+		struct device_attribute *attr, const char *buf, size_t size)
+{
+	heartbeat = (int)simple_strtol(buf, NULL, 10);
+	printk("iTCO_wdt: set timeout: %d\n", heartbeat);
+
+    iTCO_wdt_set_timeout(&iTCO_wdt_watchdog_dev, heartbeat);
+
+	// 一定要返回size，否则会一直执行
+	return size;
+}
+
+// cat enable　调用此函数
+static ssize_t enable_show(struct device *dev, 
+		struct device_attribute *attr, char *buf)
+{
+	return sprintf(buf, "%u\n", g_wdt_enable);
+}
+
+// echo 1 > enable　调用此函数
+static ssize_t enable_store(struct device *dev,
+		struct device_attribute *attr, const char *buf, size_t size)
+{
+    int ret = -1;
+	g_wdt_enable = (int)simple_strtol(buf, NULL, 10);
+
+	//printk("got data from user space: %d\n", g_wdt_enable);
+    
+    if (g_wdt_enable == 0)
+    {
+        printk("iTCO_wdt: Disable WDT!!!\n");
+      	if (!nowayout)
+            ret = iTCO_wdt_stop(&iTCO_wdt_watchdog_dev);
+        printk("iTCO_wdt: Disable WDT ret: %d\n", ret);
+    }
+    else
+    {
+        printk("iTCO_wdt: Enable WDT!!!\n");
+        iTCO_wdt_start(&iTCO_wdt_watchdog_dev);
+    }
+	// 一定要返回size，否则会一直执行
+	return size;
+}
+
+// 生成文件为wdt_timeout，WDT超时时间
+static DEVICE_ATTR(wdt_timeout, 0644, timeout_show, timeout_store);
+// 生成文件为wdt_enable，WDT超时时间
+static DEVICE_ATTR(wdt_enable, 0644, enable_show, enable_store);
+
+
+////////////////////////////////////
+
 
 /*
  *	Init & exit routines
@@ -464,6 +535,7 @@ static int iTCO_wdt_probe(struct platform_device *dev)
 			ret = -EBUSY;
 			goto out;
 		}
+        // gcs_pmc为偏移值为0x08 PMC_CFG
 		iTCO_wdt_private.gcs_pmc = ioremap(iTCO_wdt_private.gcs_pmc_res->start,
 			resource_size(iTCO_wdt_private.gcs_pmc_res));
 		if (!iTCO_wdt_private.gcs_pmc) {
@@ -554,6 +626,27 @@ static int iTCO_wdt_probe(struct platform_device *dev)
 
 	pr_info("initialized. heartbeat=%d sec (nowayout=%d)\n",
 		heartbeat, nowayout);
+
+    // 一加载不使能
+#if 1
+    heartbeat = heartbeat;
+    g_wdt_enable = 0;
+
+#else
+    // test...
+    pr_info("will start enable....\n");
+    iTCO_wdt_start(&iTCO_wdt_watchdog_dev);
+    heartbeat = heartbeat;
+    g_wdt_enable = 1;
+
+#endif
+	ret = device_create_file(&dev->dev, &dev_attr_wdt_timeout);
+	if (ret)
+		goto out;
+	ret = device_create_file(&dev->dev, &dev_attr_wdt_enable);
+	if (ret)
+		goto out;
+    
 
 	return 0;
 
