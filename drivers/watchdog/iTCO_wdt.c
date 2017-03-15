@@ -109,6 +109,7 @@ static struct {		/* this is private data for the iTCO_wdt device */
 
 /* module parameters */
 #define WATCHDOG_TIMEOUT 30	/* 30 sec default heartbeat */
+#define WATCHDOG_MAX_TIMEOUT 600 /* 手册提到最大值为613.8秒，这里限制为600秒 */
 static int heartbeat = WATCHDOG_TIMEOUT;  /* in seconds */
 module_param(heartbeat, int, 0);
 MODULE_PARM_DESC(heartbeat, "Watchdog timeout in seconds. "
@@ -125,6 +126,11 @@ static int turn_SMI_watchdog_clear_off = 1;
 module_param(turn_SMI_watchdog_clear_off, int, 0);
 MODULE_PARM_DESC(turn_SMI_watchdog_clear_off,
 	"Turn off SMI clearing watchdog (depends on TCO-version)(default=1)");
+
+static unsigned int start_withtimeout = 0;
+module_param(start_withtimeout, uint, 0);
+MODULE_PARM_DESC(start_withtimeout, "Start watchdog timer on module load with"
+	" given initial timeout. Zero (default) disables this feature.");
 
 /*
  * Some TCO specific functions
@@ -298,6 +304,10 @@ static int iTCO_wdt_set_timeout(struct watchdog_device *wd_dev, unsigned int t)
 	unsigned char val8;
 	unsigned int tmrval;
 
+    if (t > WATCHDOG_MAX_TIMEOUT)
+    {
+        t = WATCHDOG_MAX_TIMEOUT;
+    }
 	tmrval = seconds_to_ticks(t); // 时间(单位为秒)转换为tick
 
 	/* For TCO v1 the timer counts down twice before rebooting */
@@ -414,6 +424,12 @@ static ssize_t timeout_store(struct device *dev,
 		struct device_attribute *attr, const char *buf, size_t size)
 {
 	heartbeat = (int)simple_strtol(buf, NULL, 10);
+    if (heartbeat > WATCHDOG_MAX_TIMEOUT)
+    {
+        printk("watchdog timeout out of range, will set it to max timeout: %d\n", WATCHDOG_MAX_TIMEOUT);
+        heartbeat = WATCHDOG_MAX_TIMEOUT;
+    }
+    
 	printk("iTCO_wdt: set timeout: %d\n", heartbeat);
 
     iTCO_wdt_set_timeout(&iTCO_wdt_watchdog_dev, heartbeat);
@@ -624,29 +640,35 @@ static int iTCO_wdt_probe(struct platform_device *dev)
 		goto unreg_tco;
 	}
 
-	pr_info("initialized. heartbeat=%d sec (nowayout=%d)\n",
-		heartbeat, nowayout);
 
-    // 一加载不使能
-#if 1
-    heartbeat = heartbeat;
-    g_wdt_enable = 0;
+    
+    // 如果加载模块时指定时间，则开启wdt
+	if (start_withtimeout) {
+		if (start_withtimeout <= 0
+		 || start_withtimeout >  WATCHDOG_MAX_TIMEOUT) {
+			pr_err("starting timeout out of range, using default timeout\n");
+			start_withtimeout = WATCHDOG_TIMEOUT;
+        }
+        iTCO_wdt_start(&iTCO_wdt_watchdog_dev);
+        heartbeat = start_withtimeout;
+        g_wdt_enable = 1;
+        pr_info("watchdog started with initial timeout of %u sec\n",
+			start_withtimeout);
+    }
+    else
+    {
+        g_wdt_enable = 0;
+    }
 
-#else
-    // test...
-    pr_info("will start enable....\n");
-    iTCO_wdt_start(&iTCO_wdt_watchdog_dev);
-    heartbeat = heartbeat;
-    g_wdt_enable = 1;
+	pr_info("initialized. heartbeat=%d sec (nowayout=%d) %s\n",
+		heartbeat, nowayout, start_withtimeout ? "starting now" : "");
 
-#endif
 	ret = device_create_file(&dev->dev, &dev_attr_wdt_timeout);
 	if (ret)
 		goto out;
 	ret = device_create_file(&dev->dev, &dev_attr_wdt_enable);
 	if (ret)
 		goto out;
-    
 
 	return 0;
 
@@ -676,7 +698,6 @@ static int iTCO_wdt_remove(struct platform_device *dev)
 {
 	if (iTCO_wdt_private.tco_res || iTCO_wdt_private.smi_res)
 		iTCO_wdt_cleanup();
-
 	return 0;
 }
 
